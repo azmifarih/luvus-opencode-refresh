@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# luvus-opencode-refresh — restart all opencode agents in place, preserving sessions.
+#
+# Use case: a new opencode version is installed; every luvus pane running the
+# opencode TUI must pick it up without losing its conversation.
+#
+# Verified mechanism (opencode V2, luvus):
+#   1. luvus agent prompt <pane> "/exit"  -> TUI exits, pane falls back to zsh.
+#                                            Pane ID and tab position UNCHANGED.
+#   2. luvus pane run <pane> opencode --session <id>
+#                                         -> same session resumes in the same
+#                                            pane, conversation memory intact.
+#   3. luvus wait agent-status <pane> --status idle,done,blocked
+#                                         -> block until a working pane finishes.
+#
+# Usage:
+#   luvus-opencode-refresh                        dry run (default): list targets, change nothing
+#   luvus-opencode-refresh --apply                wait-for-idle, then bounce each pane
+#   luvus-opencode-refresh --apply --skip-working bounce only idle/done panes; skip working ones
+#
+# Options:
+#   --wait-timeout SEC    max wait per working pane (default 1800 = 30 min)
+#   --exit-timeout SEC    max wait for /exit to land back in shell (default 30)
+#   --start-timeout SEC   max wait for resumed TUI to come back (default 90)
+#
+# Rules:
+#   - The pane this script runs from ($LUVUS_PANE_ID) is ALWAYS skipped.
+#   - blocked panes are ALWAYS skipped (they need a human).
+#   - Panes with no session (fresh TUI, nothing to resume) are skipped.
+#   - A working pane that never goes idle within --wait-timeout is skipped.
+set -u
+
+APPLY=0
+SKIP_WORKING=0
+WAIT_TIMEOUT=1800
+EXIT_TIMEOUT=30
+START_TIMEOUT=90
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1; shift ;;
+    --skip-working) SKIP_WORKING=1; shift ;;
+    --wait-timeout) WAIT_TIMEOUT="$2"; shift 2 ;;
+    --exit-timeout) EXIT_TIMEOUT="$2"; shift 2 ;;
+    --start-timeout) START_TIMEOUT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $1 (try --help)" >&2; exit 1 ;;
+  esac
+done
+
+SELF="${LUVUS_PANE_ID:-}"
+command -v luvus >/dev/null || { echo "luvus not found in PATH" >&2; exit 1; }
+command -v jq >/dev/null || { echo "jq not found in PATH" >&2; exit 1; }
+
+echo "opencode version: $(opencode --version 2>/dev/null || echo unknown)"
+[ -n "$SELF" ] && echo "own pane (always skipped): $SELF" || echo "warning: LUVUS_PANE_ID unset, no self-exclusion"
+
+AGENTS_JSON="$(luvus agent list 2>/dev/null)" || { echo "luvus agent list failed" >&2; exit 1; }
+TARGETS="$(echo "$AGENTS_JSON" | jq -r --arg self "$SELF" \
+  '[.result.agents[] | select(.agent=="opencode" and .pane!=($self|tostring))
+    | "\(.pane)\t\(.status)\t\(.session // "")\t\(.tab)\t\(.cwd)\t\(.name // "-")" ] | join("\n")')"
+
+if [ -z "$TARGETS" ]; then echo "no other opencode panes found."; exit 0; fi
+
+bounced=0; skipped=0; failed=0
+
+bounce_one() { # pane status session tab cwd name
+  local pane="$1" status="$2" session="$3" tab="$4" cwd="$5" name="$6"
+
+  if [ "$status" = "blocked" ]; then
+    echo "[$pane] SKIP (tab $tab, $cwd): blocked — needs a human"; skipped=$((skipped+1)); return
+  fi
+  if [ -z "$session" ] || [ "$session" = "null" ]; then
+    echo "[$pane] SKIP (tab $tab, $cwd): no session yet (fresh TUI, nothing to resume)"; skipped=$((skipped+1)); return
+  fi
+  if [ "$status" = "working" ]; then
+    if [ "$SKIP_WORKING" = "1" ]; then
+      echo "[$pane] SKIP (tab $tab, session $session): still working (--skip-working)"; skipped=$((skipped+1)); return
+    fi
+    echo "[$pane] working — waiting up to ${WAIT_TIMEOUT}s for idle (tab $tab, session $session)..."
+    if ! luvus wait agent-status "$pane" --status idle,done,blocked --timeout "$WAIT_TIMEOUT" >/dev/null 2>&1; then
+      echo "[$pane] SKIP: still working after ${WAIT_TIMEOUT}s"; skipped=$((skipped+1)); return
+    fi
+    status="$(luvus agent get "$pane" 2>/dev/null | jq -r '.result.status')"
+    if [ "$status" = "blocked" ]; then
+      echo "[$pane] SKIP: ended up blocked — needs a human"; skipped=$((skipped+1)); return
+    fi
+    if [ "$status" = "working" ]; then
+      echo "[$pane] SKIP: still working after wait"; skipped=$((skipped+1)); return
+    fi
+  fi
+
+  echo "[$pane] stopping (was $status, tab $tab, session $session)..."
+  luvus agent prompt "$pane" "/exit" >/dev/null 2>&1
+  local waited=0
+  while [ "$waited" -lt "$EXIT_TIMEOUT" ]; do
+    if [ "$(luvus agent get "$pane" 2>/dev/null | jq -r '.result.agent')" != "opencode" ]; then break; fi
+    sleep 2; waited=$((waited+2))
+  done
+  if [ "$(luvus agent get "$pane" 2>/dev/null | jq -r '.result.agent')" = "opencode" ]; then
+    # Old TUIs may not know /exit ("No matching commands"). Fallback: SIGTERM
+    # the pane's own TUI process, matched by exact session ID. The conversation
+    # lives in SQLite, so resume still works; the pane falls back to shell.
+    echo "[$pane] /exit had no effect — terminating TUI process holding session $session ..."
+    TPID="$(pgrep -f "opencode.*${session}" | head -1)"
+    if [ -n "${TPID:-}" ]; then kill "$TPID" 2>/dev/null && echo "[$pane] sent SIGTERM to pid $TPID"; else echo "[$pane] no TUI process found for session"; fi
+    waited=0
+    while [ "$waited" -lt "$EXIT_TIMEOUT" ]; do
+      if [ "$(luvus agent get "$pane" 2>/dev/null | jq -r '.result.agent')" != "opencode" ]; then break; fi
+      sleep 2; waited=$((waited+2))
+    done
+  fi
+  if [ "$(luvus agent get "$pane" 2>/dev/null | jq -r '.result.agent')" = "opencode" ]; then
+    echo "[$pane] FAIL: TUI still alive after ${EXIT_TIMEOUT}s — left untouched"; failed=$((failed+1)); return
+  fi
+
+  echo "[$pane] resuming session $session ..."
+  luvus pane run "$pane" opencode --session "$session" >/dev/null 2>&1
+  waited=0
+  while [ "$waited" -lt "$START_TIMEOUT" ]; do
+    if [ "$(luvus agent get "$pane" 2>/dev/null | jq -r '.result | "\(.agent)/\(.session // "")"')" = "opencode/$session" ]; then break; fi
+    sleep 3; waited=$((waited+3))
+  done
+  if [ "$(luvus agent get "$pane" 2>/dev/null | jq -r '.result.session // ""')" = "$session" ]; then
+    echo "[$pane] OK: resumed $session"; bounced=$((bounced+1))
+  else
+    echo "[$pane] FAIL: resume not confirmed after ${START_TIMEOUT}s — check manually"; failed=$((failed+1))
+  fi
+}
+
+if [ "$APPLY" = "0" ]; then
+  echo "--- DRY RUN (no changes). Targets: ---"
+  echo "$TARGETS" | while IFS=$'\t' read -r pane status session tab cwd name; do
+    echo "[$pane] status=$status session=${session:-none} tab=$tab cwd=$cwd name=$name"
+  done
+  echo "--- run with --apply to bounce ---"
+  exit 0
+fi
+
+while IFS=$'\t' read -r pane status session tab cwd name; do
+  bounce_one "$pane" "$status" "$session" "$tab" "$cwd" "$name"
+done <<< "$TARGETS"
+
+echo "=== done: bounced=$bounced skipped=$skipped failed=$failed ==="
+[ "$failed" -gt 0 ] && exit 1 || exit 0
